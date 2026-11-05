@@ -3,47 +3,36 @@ on:
   workflow_dispatch:
     inputs:
       prompt:
-        description: 'App Idea Prompt'
         required: true
       app_name:
-        description: 'App Name'
         required: true
       app_id:
-        description: 'Unique App ID Suffix'
         required: true
-
 jobs:
   build-apk:
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
-
-      - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Generate Native Java Android Project
+      - uses: android-actions/setup-android@v3
+      - name: Generate and Compile Native Android App
         env:
           USER_PROMPT: ${{ github.event.inputs.prompt }}
           APP_NAME: ${{ github.event.inputs.app_name }}
           APP_ID: ${{ github.event.inputs.app_id }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           mkdir -p app/src/main/java/com/ai/$APP_ID
           mkdir -p app/src/main/assets
-
           cat << 'EOF' > settings.gradle
           rootProject.name = "AIApp"
           include ':app'
           EOF
-
           cat << 'EOF' > build.gradle
           buildscript {
               repositories { google(); mavenCentral() }
@@ -51,7 +40,6 @@ jobs:
           }
           allprojects { repositories { google(); mavenCentral() } }
           EOF
-
           cat << EOF > app/build.gradle
           plugins { id 'com.android.application' }
           android {
@@ -70,18 +58,13 @@ jobs:
               }
           }
           EOF
-
           cat << EOF > app/src/main/AndroidManifest.xml
           <?xml version="1.0" encoding="utf-8"?>
           <manifest xmlns:android="http://schemas.android.com/apk/res/android">
               <uses-permission android:name="android.permission.INTERNET" />
-              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />
-              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />
-              <uses-permission android:name="android.permission.VIBRATE" />
               <application
                   android:label="$APP_NAME"
                   android:usesCleartextTraffic="true"
-                  android:requestLegacyExternalStorage="true"
                   android:theme="@android:style/Theme.Material.Light.NoActionBar">
                   <activity
                       android:name=".MainActivity"
@@ -95,50 +78,110 @@ jobs:
               </application>
           </manifest>
           EOF
-
-          # Ask AI to write Pure Native Android Java (MainActivity.java)
-          python3 - << 'EOF'
+          cat << 'PYEOF' > gen_java.py
           import os, json, urllib.request
-
           prompt = os.environ['USER_PROMPT']
           app_id = os.environ['APP_ID']
-
-          sys_prompt = (
-              f"Write a COMPLETE, single-file native Android Java class `MainActivity` in package `com.ai.{app_id}`. "
-              "Return ONLY valid Java source code starting with `package com.ai." + app_id + ";` and ending with `}`. "
-              "Do NOT use markdown fences. Do NOT use AndroidX or external libraries; use ONLY standard `android.*` and `java.*` packages "
-              "(such as `android.app.Activity`, `android.widget.*`, `android.graphics.pdf.PdfDocument`, `android.graphics.*`, `android.content.*`, `android.net.Uri`, `android.os.*`). "
-              "Build the entire UI programmatically in `onCreate` using `ScrollView`, `LinearLayout`, `Button`, `EditText`, `TextView`, etc. "
-              "Include full working logic, file pickers (`Intent.ACTION_GET_CONTENT` with `EXTRA_ALLOW_MULTIPLE`), and save outputs to `Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)`. "
-              "App to build: " + prompt
+          sys_java = (
+              f'Write a COMPLETE single-file Android Java class MainActivity in package com.ai.{app_id}. '
+              f'Return ONLY valid Java code starting with package com.ai.{app_id}; and ending with }}. '
+              'Do NOT use markdown fences. Use ONLY standard android.* and java.* packages (Activity, LinearLayout, ScrollView, Button, EditText, TextView, PdfDocument, Bitmap, BitmapFactory, Canvas, Paint, Intent, Uri, Bundle, BufferedReader, InputStreamReader, InputStream, OutputStream, ArrayList, Toast). '
+              'Build the UI programmatically in onCreate. Use ACTION_GET_CONTENT with EXTRA_ALLOW_MULTIPLE to pick multiple files, and use Intent.ACTION_CREATE_DOCUMENT with type application/pdf so the user can choose the exact save location in local storage without needing storage permissions! '
+              'App idea: ' + prompt
           )
-
-          data = json.dumps({
-              "messages": [{"role": "user", "content": sys_prompt}],
-              "model": "openai"
-          }).encode('utf-8')
-
-          req = urllib.request.Request("https://text.pollinations.ai/", data=data, headers={'Content-Type': 'application/json'})
-          with urllib.request.urlopen(req, timeout=90) as resp:
-              code = resp.read().decode('utf-8').strip()
-
-          if "```" in code:
-              lines = [l for l in code.splitlines() if not l.strip().startswith("```")]
-              code = "\n".join(lines)
-          if "package " in code:
-              code = code[code.index("package "):]
-
-          with open(f"app/src/main/java/com/ai/{app_id}/MainActivity.java", "w", encoding="utf-8") as f:
+          req = urllib.request.Request('https://text.pollinations.ai/', data=json.dumps({'messages':[{'role':'user','content':sys_java}],'model':'openai'}).encode('utf-8'), headers={'Content-Type':'application/json', 'User-Agent':'Mozilla/5.0'})
+          with urllib.request.urlopen(req, timeout=90) as r:
+              code = r.read().decode('utf-8').strip()
+          if '```' in code:
+              code = '\n'.join([l for l in code.splitlines() if not l.strip().startswith('```')])
+          if 'package ' in code:
+              code = code[code.index('package '):]
+          with open(f'app/src/main/java/com/ai/{app_id}/MainActivity.java', 'w', encoding='utf-8') as f:
               f.write(code)
+          PYEOF
+          python3 gen_java.py || true
+          if ! gradle assembleDebug; then
+            cat << 'PYEOF2' > gen_html.py
+          import os, json, urllib.request
+          prompt = os.environ['USER_PROMPT']
+          sys_html = (
+              'Return ONLY raw HTML5 code starting with <!DOCTYPE html> and ending with </html>. '
+              'Include CSS in <style> and JS in <script>. Load pdf-lib and jspdf from cdnjs.cloudflare.com to merge .pdf, .jpg, .png, .txt, .eml files and URLs into a single PDF. '
+              'When saving the merged PDF, convert the PDF bytes to a Base64 string and call window.AndroidBridge.saveFileWithPicker(base64String, "merged.pdf") so the user can choose the save location in local storage! '
+              'Build: ' + prompt
+          )
+          req = urllib.request.Request('https://text.pollinations.ai/', data=json.dumps({'messages':[{'role':'user','content':sys_html}],'model':'openai'}).encode('utf-8'), headers={'Content-Type':'application/json', 'User-Agent':'Mozilla/5.0'})
+          with urllib.request.urlopen(req, timeout=90) as r:
+              html = r.read().decode('utf-8').strip()
+          if '<!DOCTYPE html>' in html: html = html[html.index('<!DOCTYPE html>'):]
+          elif '<html' in html: html = html[html.index('<html'):]
+          if '</html>' in html: html = html[:html.rindex('</html>')+7]
+          with open('app/src/main/assets/index.html', 'w', encoding='utf-8') as f: f.write(html)
+          PYEOF2
+            python3 gen_html.py
+            cat << EOF > app/src/main/java/com/ai/$APP_ID/MainActivity.java
+          package com.ai.$APP_ID;
+          import android.app.Activity;
+          import android.content.*;
+          import android.net.Uri;
+          import android.os.*;
+          import android.util.Base64;
+          import android.webkit.*;
+          import android.widget.Toast;
+          import java.io.*;
+          public class MainActivity extends Activity {
+              private ValueCallback<Uri[]> cb;
+              private byte[] pendingBytes;
+              @Override protected void onCreate(Bundle b) {
+                  super.onCreate(b);
+                  WebView w = new WebView(this);
+                  WebSettings s = w.getSettings();
+                  s.setJavaScriptEnabled(true); s.setDomStorageEnabled(true); s.setAllowFileAccess(true);
+                  w.addJavascriptInterface(new Object() {
+                      @JavascriptInterface public void saveFileWithPicker(String b64, String name) {
+                          try {
+                              if (b64.contains(",")) b64 = b64.substring(b64.indexOf(",") + 1);
+                              pendingBytes = Base64.decode(b64, Base64.DEFAULT);
+                              Intent i = new Intent(Intent.ACTION_CREATE_DOCUMENT);
+                              i.addCategory(Intent.CATEGORY_OPENABLE);
+                              i.setType("application/pdf");
+                              i.putExtra(Intent.EXTRA_TITLE, name);
+                              startActivityForResult(i, 102);
+                          } catch (Exception e) {}
+                      }
+                  }, "AndroidBridge");
+                  w.setWebChromeClient(new WebChromeClient() {
+                      @Override public boolean onShowFileChooser(WebView v, ValueCallback<Uri[]> fileCb, FileChooserParams p) {
+                          cb = fileCb;
+                          Intent i = new Intent(Intent.ACTION_GET_CONTENT).addCategory(Intent.CATEGORY_OPENABLE).setType("*/*").putExtra(Intent.EXTRA_ALLOW_MULTIPLE, true);
+                          startActivityForResult(Intent.createChooser(i, "Select Files"), 101);
+                          return true;
+                      }
+                  });
+                  setContentView(w);
+                  w.loadUrl("file:///android_asset/index.html");
+              }
+              @Override protected void onActivityResult(int req, int res, Intent d) {
+                  if (req == 101 && cb != null) {
+                      Uri[] u = null;
+                      if (res == RESULT_OK && d != null) {
+                          if (d.getClipData() != null) {
+                              int c = d.getClipData().getItemCount(); u = new Uri[c];
+                              for (int i=0; i<c; i++) u[i] = d.getClipData().getItemAt(i).getUri();
+                          } else if (d.getData() != null) u = new Uri[]{d.getData()};
+                      }
+                      cb.onReceiveValue(u); cb = null;
+                  } else if (req == 102 && res == RESULT_OK && d != null && pendingBytes != null) {
+                      try {
+                          OutputStream os = getContentResolver().openOutputStream(d.getData());
+                          os.write(pendingBytes); os.flush(); os.close();
+                          Toast.makeText(this, "Saved successfully!", Toast.LENGTH_LONG).show();
+                      } catch (Exception e) {}
+                  }
+              }
+          }
           EOF
-
-      - name: Compile APK with Official Android SDK Gradle
-        env:
-          APP_ID: ${{ github.event.inputs.app_id }}
-        run: |
-          gradle assembleDebug
-          cp app/build/outputs/apk/debug/app-debug.apk ${{ github.event.inputs.app_id }}.apk
-          gh release create "v-${{ github.event.inputs.app_id }}" "${{ github.event.inputs.app_id }}.apk" --title "Build ${{ github.event.inputs.app_id }}" --notes "Native Android APK"
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          
+            gradle assembleDebug
+          fi
+          cp app/build/outputs/apk/debug/app-debug.apk $APP_ID.apk
+          gh release create "v-$APP_ID" "$APP_ID.apk" --title "Build $APP_ID" --notes "Signed Android APK"
